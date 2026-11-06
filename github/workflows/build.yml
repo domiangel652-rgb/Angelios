@@ -1,0 +1,294 @@
+: build-ffmod
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: build-ffmod
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: android-actions/setup-android@v3
+      - name: SDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125" >/dev/null
+          echo "NDK=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
+
+      - name: Fuentes
+        run: |
+          mkdir -p native app/com/venice/menu
+          cat > native/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.18)
+          project(ffmod CXX)
+          add_library(ffmod SHARED hack.cpp)
+          target_compile_options(ffmod PRIVATE -O2 -fvisibility=hidden)
+          target_link_libraries(ffmod log)
+          EOF
+          cat > native/hack.cpp <<'EOF'
+          #include <jni.h>
+          #include <cstring>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <vector>
+          #include <string>
+          #include <fstream>
+          #include <sstream>
+          #include <regex>
+          #include <unistd.h>
+          #include <sys/mman.h>
+          #include <android/log.h>
+
+          #define LOG(...) __android_log_print(ANDROID_LOG_INFO,"FFMOD",__VA_ARGS__)
+          struct Reg { uintptr_t a; size_t n; bool exec; };
+
+          static std::vector<Reg> maps() {
+            std::vector<Reg> v; std::ifstream f("/proc/self/maps"); std::string l;
+            while (std::getline(f, l)) {
+              if (l.find("libil2cpp") == std::string::npos) continue;
+              uintptr_t s; size_t e;
+              if (sscanf(l.c_str(), "%lx-%lx", &s, &e) != 2) continue;
+              bool ex = l.find("r-xp") != std::string::npos;
+              bool rw = l.find("rw-p") != std::string::npos;
+              if (ex || rw) v.push_back({s, e - s, ex});
+            }
+            return v;
+          }
+
+          static bool unprotect(uintptr_t a, size_t n) {
+            long ps = sysconf(_SC_PAGESIZE);
+            uintptr_t st = a & ~(ps - 1);
+            size_t len = ((a + n) - st + ps - 1) & ~(ps - 1);
+            return mprotect((void*)st, len, PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
+          }
+
+          // parche por firma de bytes (AOB) sobre zona ejecutable
+          static int patchImm(float from, float to) {
+            uint32_t a, b;
+            memcpy(&a, &from, 4); memcpy(&b, &to, 4);
+            int hits = 0;
+            for (auto& r : maps()) {
+              if (!r.exec) continue;
+              uint8_t* p = (uint8_t*)r.a;
+              for (size_t i = 0; i + 4 < r.n; i++) {
+                if (memcmp(p + i, &a, 4) != 0) continue;
+                if (!unprotect((uintptr_t)(p + i), 4)) continue;
+                memcpy(p + i, &b, 4);
+                __builtin___clear_cache((char*)(p + i), (char*)(p + i + 4));
+                hits++;
+                if (hits > 64) return hits;
+              }
+            }
+            LOG("patchImm %f->%f hits=%d", from, to, hits);
+            return hits;
+          }
+
+          // parche por grupo de floats en zona de datos
+          static int patchVal(const float* pat, int n, float val, bool mul, float cap) {
+            int hits = 0;
+            for (auto& r : maps()) {
+              if (r.exec) continue;
+              float* p = (float*)r.a;
+              size_t lim = r.n / 4 - n;
+              for (size_t i = 0; i < lim; i++) {
+                bool ok = true;
+                for (int k = 0; k < n; k++) if (p[i+k] != pat[k]) { ok = false; break; }
+                if (!ok) continue;
+                if (!unprotect((uintptr_t)&p[i], n * 4)) continue;
+                for (int k = 0; k < n; k++) {
+                  float v = mul ? p[i+k] * val : val;
+                  if (mul && cap > 0 && v > cap) v = cap;
+                  p[i+k] = v;
+                }
+                hits++;
+                if (hits > 20000) return hits;
+              }
+            }
+            return hits;
+          }
+
+          static void cfgWrite(const char* key, const char* val) {
+            const char* c[] = {
+              "/data/data/com.dts.freefireth/files/deviceConfig",
+              "/data/data/com.dts.freefireth/files/device_config",
+              "/data/data/com.dts.freefireth/files/settings.xml",
+              "/data/data/com.dts.freefiremax/files/deviceConfig",
+              "/sdcard/Android/data/com.dts.freefireth/files/deviceConfig"};
+            for (auto p : c) {
+              std::ifstream in(p); if (!in) continue;
+              std::stringstream ss; ss << in.rdbuf(); in.close();
+              std::string t = ss.str();
+              std::regex re(std::string("(") + key + ")(\"?\\s*=\\s*\"?)[^\"\\s>]+");
+              std::ofstream out(p); out << std::regex_replace(t, re, std::string("$1$2") + val); out.close();
+            }
+          }
+
+          static const float P_RECOIL[] = {0.1f,0.15f,0.2f,0.25f};
+          static const float P_AIM[]    = {0.3f,0.4f,0.5f};
+          static const float P_AIM2[]   = {0.5f,0.75f,1.0f};
+
+          extern "C" {
+          JNIEXPORT void JNICALL Java_com_venice_menu_Menu_nInputLag(JNIEnv*, jclass, jboolean on) {
+            if (!on) return;
+            cfgWrite("fps","144"); cfgWrite("framerate","144"); cfgWrite("frameRate","144");
+            cfgWrite("shaders","0"); cfgWrite("shadow","0"); cfgWrite("quality","1");
+            cfgWrite("antialias","0"); cfgWrite("postprocess","0");
+          }
+          JNIEXPORT void JNICALL Java_com_venice_menu_Menu_nFov(JNIEnv*, jclass, jboolean on) {
+            patchImm(90.0f, on ? 112.0f : 90.0f);
+            patchImm(60.0f, on ? 78.0f : 60.0f);
+          }
+          JNIEXPORT void JNICALL Java_com_venice_menu_Menu_nSpeed(JNIEnv*, jclass, jboolean on) {
+            patchImm(6.0f, on ? 8.4f : 6.0f);
+            patchImm(7.0f, on ? 9.8f : 7.0f);
+          }
+          JNIEXPORT void JNICALL Java_com_venice_menu_Menu_nRecoil(JNIEnv*, jclass, jboolean on) {
+            if (on) patchVal(P_RECOIL, 4, 0.f, false, 0.f);
+          }
+          JNIEXPORT void JNICALL Java_com_venice_menu_Menu_nAim(JNIEnv*, jclass, jboolean on) {
+            if (!on) return;
+            patchVal(P_AIM,  3, 3.2f, true, 60.f);
+            patchVal(P_AIM2, 3, 3.2f, true, 60.f);
+            patchVal(P_RECOIL, 4, 0.f, false, 0.f);
+          }
+          }
+          EOF
+
+          cat > app/com/venice/menu/Loader.java <<'EOF'
+          package com.venice.menu;
+          public class Loader extends android.app.Application {
+            @Override public void onCreate() {
+              super.onCreate();
+              try { System.loadLibrary("ffmod"); } catch (Throwable t) {}
+              try { Menu.start(this); } catch (Throwable t) {}
+            }
+          }
+          EOF
+
+          cat > app/com/venice/menu/Menu.java <<'EOF'
+          package com.venice.menu;
+          import android.content.*;
+          import android.graphics.*;
+          import android.net.Uri;
+          import android.provider.Settings;
+          import android.view.*;
+          import android.widget.*;
+
+          public class Menu {
+            public static native void nInputLag(boolean on);
+            public static native void nFov(boolean on);
+            public static native void nSpeed(boolean on);
+            public static native void nRecoil(boolean on);
+            public static native void nAim(boolean on);
+
+            private static TextView btn(Context c, String t, int bg) {
+              TextView v = new TextView(c);
+              v.setText(t); v.setTextColor(Color.WHITE); v.setTextSize(13);
+              v.setGravity(Gravity.CENTER); v.setPadding(26,22,26,22);
+              v.setBackgroundColor(bg); return v;
+            }
+
+            public static void start(final Context ctx) {
+              if (!Settings.canDrawOverlays(ctx)) {
+                try {
+                  ctx.startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + ctx.getPackageName()))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                } catch (Throwable t) {}
+                return;
+              }
+              final WindowManager wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
+              final LinearLayout box = new LinearLayout(ctx);
+              box.setOrientation(LinearLayout.VERTICAL);
+              box.setBackgroundColor(0xE6101014);
+              final LinearLayout panel = new LinearLayout(ctx);
+              panel.setOrientation(LinearLayout.VERTICAL);
+              panel.setVisibility(View.GONE);
+
+              String[] names = {"INPUT LAG","FOV","NO RECOIL","AIMBOT 98%","SPEED"};
+              int[] cols = {0xFF1F6FEB,0xFF1F6FEB,0xFF1F6FEB,0xFF6E40C9,0xFF1F6FEB};
+              final boolean[] st = new boolean[5];
+              for (int i = 0; i < names.length; i++) {
+                final int idx = i;
+                final TextView b = btn(ctx, names[i] + ": OFF", cols[i]);
+                b.setOnClickListener(v -> {
+                  st[idx] = !st[idx];
+                  b.setText(names[idx] + (st[idx] ? ": ON" : ": OFF"));
+                  b.setBackgroundColor(st[idx] ? 0xFF238636 : cols[idx]);
+                  if (idx == 0) nInputLag(st[idx]);
+                  if (idx == 1) nFov(st[idx]);
+                  if (idx == 2) nRecoil(st[idx]);
+                  if (idx == 3) nAim(st[idx]);
+                  if (idx == 4) nSpeed(st[idx]);
+                  Toast.makeText(ctx, names[idx] + (st[idx] ? " ON" : " OFF"), Toast.LENGTH_SHORT).show();
+                });
+                panel.addView(b);
+              }
+
+              final TextView head = btn(ctx, "FF MOD", 0xFF9E6A03);
+              head.setOnClickListener(v -> panel.setVisibility(panel.getVisibility()==View.GONE?View.VISIBLE:View.GONE));
+              box.addView(head); box.addView(panel);
+
+              WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT);
+              lp.gravity = Gravity.TOP | Gravity.START; lp.x = 20; lp.y = 200;
+              wm.addView(box, lp);
+            }
+          }
+          EOF
+
+      - name: Compilar nativo
+        run: |
+          cd native
+          cmake -B build -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 .
+          cmake --build build -j4 && ls -la build/libffmod.so
+
+      - name: Compilar menú
+        run: |
+          AJ=$ANDROID_HOME/platforms/android-34/android.jar
+          mkdir -p out dexout
+          javac -source 8 -target 8 -classpath "$AJ" -d out $(find app -name "*.java")
+          $ANDROID_HOME/build-tools/34.0.0/d8 --lib "$AJ" --output dexout $(find out -name "*.class")
+
+      - name: Bajar Free Fire
+        run: |
+          wget -q https://github.com/EFForg/apkeep/releases/latest/download/apkeep-x86_64-unknown-linux-gnu -O apkeep
+          chmod +x apkeep && ./apkeep -a com.dts.freefireth -d apkpure ./base && ls -la base
+
+      - name: Inyectar
+        run: |
+          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O apktool.jar
+          APK=$(find base -name "*.apk" -o -name "*.xapk" | head -1)
+          if [[ "$APK" == *.xapk ]]; then unzip -o "$APK" -d x && APK=$(find x -name "*.apk" | grep -i base | head -1); fi
+          java -jar apktool.jar d -f "$APK" -o dec
+          python3 - <<'EOF'
+          import re
+          p="dec/AndroidManifest.xml"
+          m=open(p,encoding="utf-8").read()
+          a=re.search(r'<application[^>]*android:name="([^"]+)"',m)
+          m=m.replace(a.group(0), a.group(0).replace(a.group(1),"com.venice.menu.Loader")) if a \
+            else m.replace("<application","<application android:name=\"com.venice.menu.Loader\"",1)
+          if "SYSTEM_ALERT_WINDOW" not in m:
+              m=m.replace("</manifest>","<uses-permission android:name=\"android.permission.SYSTEM_ALERT_WINDOW\"/></manifest>")
+          open(p,"w",encoding="utf-8").write(m)
+          EOF
+          mkdir -p dec/lib/arm64-v8a
+          cp native/build/libffmod.so dec/lib/arm64-v8a/
+          cp dexout/classes.dex dec/classes2.dex
+
+      - name: Firmar
+        run: |
+          java -jar apktool.jar b dec -o unsigned.apk
+          keytool -genkeypair -keystore k.jks -storepass 123456 -keypass 123456 -alias k -keyalg RSA -validity 10000 -dname "CN=FFMOD" >/dev/null 2>&1
+          $ANDROID_HOME/build-tools/34.0.0/zipalign -f 4 unsigned.apk aligned.apk
+          $ANDROID_HOME/build-tools/34.0.0/apksigner sign --ks k.jks --ks-pass pass:123456 --key-pass pass:123456 --out FF_MOD.apk aligned.apk
+
+      - uses: actions/upload-artifact@v4
+        with: { name: FF_MOD_APK, path: FF_MOD.apk }
